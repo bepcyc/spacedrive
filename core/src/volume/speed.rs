@@ -502,4 +502,136 @@ mod tests {
 		assert!(write_speed > 0);
 		assert!(!mount_path.join("tmp").exists());
 	}
+	/// A volume as the volume manager sees it, for the speed-test entry point (the fields mirror `test_full_speed_test`)
+	fn test_volume(mount_path: &std::path::Path) -> Volume {
+		let device_id = uuid::Uuid::new_v4();
+		let mount_point = mount_path.to_path_buf();
+		let now = chrono::Utc::now();
+		Volume {
+			id: uuid::Uuid::new_v4(),
+			fingerprint: VolumeFingerprint::from_primary_volume(&mount_point, device_id),
+			cloud_identifier: None,
+			cloud_config: None,
+			device_id,
+			name: "Test Volume".to_string(),
+			library_id: None,
+			is_tracked: false,
+			mount_point: mount_point.clone(),
+			mount_points: vec![mount_point],
+			volume_type: VolumeType::External,
+			mount_type: MountType::External,
+			disk_type: DiskType::Unknown,
+			file_system: FileSystem::Other("test".to_string()),
+			total_capacity: 1000000000,
+			available_space: 500000000,
+			is_read_only: false,
+			is_mounted: true,
+			hardware_id: None,
+			backend: None,
+			apfs_container: None,
+			container_volume_id: None,
+			path_mappings: Vec::new(),
+			is_user_visible: true,
+			auto_track_eligible: false,
+			read_speed_mbps: None,
+			write_speed_mbps: None,
+			created_at: now,
+			updated_at: now,
+			last_seen_at: now,
+			total_files: None,
+			total_directories: None,
+			last_stats_update: None,
+			display_name: Some("Test Volume".to_string()),
+			is_favorite: false,
+			color: None,
+			icon: None,
+			error_message: None,
+		}
+	}
+
+	/// Names of the entries of `dir` that a speed test writes (test file, permission probe)
+	async fn speed_test_artifacts(dir: &std::path::Path) -> Vec<String> {
+		let mut found = Vec::new();
+		let mut entries = tokio::fs::read_dir(dir).await.unwrap();
+		while let Some(entry) = entries.next_entry().await.unwrap() {
+			let name = entry.file_name().to_string_lossy().to_string();
+			if name.starts_with(".spacedrive_speed_test-") || name.starts_with(".spacedrive_write_test-") {
+				found.push(name);
+			}
+		}
+		found
+	}
+
+	#[tokio::test]
+	async fn test_full_speed_test_keeps_existing_tmp_and_leaves_no_test_file() {
+		// the case of issue #3056: a volume whose root holds a user's `tmp` directory with data in it
+		let volume_dir = TempDir::new().unwrap();
+		let existing_tmp = volume_dir.path().join("tmp");
+		tokio::fs::create_dir_all(existing_tmp.join("nested")).await.unwrap();
+		let user_file = existing_tmp.join("user-data.txt");
+		let nested_file = existing_tmp.join("nested").join("more-data.bin");
+		tokio::fs::write(&user_file, b"keep me").await.unwrap();
+		tokio::fs::write(&nested_file, vec![7u8; 4096]).await.unwrap();
+
+		let config = SpeedTestConfig {
+			file_size_mb: 1,
+			timeout_secs: 10,
+			iterations: 2,
+		};
+		let (read_speed, write_speed) =
+			run_speed_test_with_config(&test_volume(volume_dir.path()), config)
+				.await
+				.unwrap();
+		assert!(read_speed > 0);
+		assert!(write_speed > 0);
+
+		// the directory and every file in it survive, unchanged
+		assert!(existing_tmp.is_dir());
+		assert_eq!(tokio::fs::read(&user_file).await.unwrap(), b"keep me");
+		assert_eq!(tokio::fs::read(&nested_file).await.unwrap(), vec![7u8; 4096]);
+		// the test file and the permission probe are gone, from the directory the test used and from the root
+		assert!(speed_test_artifacts(&existing_tmp).await.is_empty());
+		assert!(speed_test_artifacts(volume_dir.path()).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_speed_test_errors_leave_the_volume_untouched() {
+		let volume_dir = TempDir::new().unwrap();
+		let existing_tmp = volume_dir.path().join("tmp");
+		tokio::fs::create_dir(&existing_tmp).await.unwrap();
+		tokio::fs::write(existing_tmp.join("user-data.txt"), b"keep me")
+			.await
+			.unwrap();
+
+		// a read-only volume is refused before anything is written
+		let mut read_only = test_volume(volume_dir.path());
+		read_only.is_read_only = true;
+		assert!(matches!(
+			run_speed_test_with_config(&read_only, SpeedTestConfig::default()).await,
+			Err(VolumeError::ReadOnly(_))
+		));
+
+		// so is an unmounted one
+		let mut unmounted = test_volume(volume_dir.path());
+		unmounted.is_mounted = false;
+		assert!(matches!(
+			run_speed_test_with_config(&unmounted, SpeedTestConfig::default()).await,
+			Err(VolumeError::NotMounted(_))
+		));
+
+		// a mount point that no longer exists has no writable directory, and none is created
+		let gone = volume_dir.path().join("unplugged");
+		assert!(matches!(
+			run_speed_test_with_config(&test_volume(&gone), SpeedTestConfig::default()).await,
+			Err(VolumeError::PermissionDenied(_))
+		));
+		assert!(!gone.exists());
+
+		assert_eq!(
+			tokio::fs::read(existing_tmp.join("user-data.txt")).await.unwrap(),
+			b"keep me"
+		);
+		assert!(speed_test_artifacts(&existing_tmp).await.is_empty());
+		assert!(speed_test_artifacts(volume_dir.path()).await.is_empty());
+	}
 }
